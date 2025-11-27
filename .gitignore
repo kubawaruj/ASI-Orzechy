@@ -27,6 +27,9 @@ share/python-wheels/
 .installed.cfg
 *.egg
 walnuts/
+checkpoints/
+predictions/
+unet_effb0_segmentation.h5
 MANIFEST
 
 # PyInstaller
