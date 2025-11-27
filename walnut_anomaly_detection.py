@@ -45,32 +45,24 @@ class AnomalyDetector(nn.Module):
         # --- ENCODER ---
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride=2, padding=1),   # 512 -> 256
-            nn.BatchNorm2d(32),
             nn.ReLU(),
 
             nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 256 -> 128
-            nn.BatchNorm2d(64),
             nn.ReLU(),
 
             nn.Conv2d(64, 128, 3, stride=2, padding=1), # 128 -> 64
-            nn.BatchNorm2d(128),
             nn.ReLU(),
 
-            nn.Conv2d(128, 256, 3, stride=2, padding=1), # 64 -> 32
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
+
         )
 
         # Bottleneck
         self.flatten = nn.Flatten()
-        self.fc_enc = nn.Linear(256 * 32 * 32, 1024)
-        self.fc_dec = nn.Linear(1024, 256 * 32 * 32)
+        self.fc_enc = nn.Linear(128 * 64 * 64, 1024)
+        self.fc_dec = nn.Linear(1024, 128 * 64 * 64)
 
         # --- DECODER ---
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 3, stride=2, padding=1, output_padding=1),  # 32 -> 64
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
 
             nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1),   # 64 -> 128
             nn.BatchNorm2d(64),
@@ -90,7 +82,7 @@ class AnomalyDetector(nn.Module):
         x = torch.relu(self.fc_enc(x))
 
         x = torch.relu(self.fc_dec(x))
-        x = x.view(-1, 256, 32, 32)
+        x = x.view(-1, 128, 64, 64)
 
         x = self.decoder(x)
         return x
@@ -103,11 +95,11 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 # --- Wczytanie lub trenowanie (z opcją douczania) ---
 if os.path.exists(MODEL_PATH):
-    print(f"✅ Wczytywanie istniejącego modelu z: {MODEL_PATH}")
+    print(f"Wczytywanie istniejącego modelu z: {MODEL_PATH}")
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 
     if N_EPOCHS > 0:
-        print(f"🔁 Douczanie modelu przez {N_EPOCHS} epok...")
+        print(f"Douczanie modelu przez {N_EPOCHS} epok...")
         for epoch in range(N_EPOCHS):
             model.train()
             train_loss = 0.0
@@ -122,12 +114,12 @@ if os.path.exists(MODEL_PATH):
             print(f"[Douczanie] Epoch [{epoch + 1}/{N_EPOCHS}] Loss: {train_loss / len(train_loader):.4f}")
 
         torch.save(model.state_dict(), MODEL_PATH)
-        print(f"💾 Model został zaktualizowany i zapisany ponownie: {MODEL_PATH}")
+        print(f"Model został douczony i zapisany: {MODEL_PATH}")
     else:
-        print("⏭ Pomijam trenowanie (N_EPOCHS = 0).")
+        print("Pomijam trenowanie (N_EPOCHS = 0).")
 
 else:
-    print("⏳ Trenowanie nowego modelu od zera...")
+    print("Trenowanie modelu od zera..")
     for epoch in range(N_EPOCHS):
         model.train()
         train_loss = 0.0
@@ -142,7 +134,7 @@ else:
         print(f"[Nowy model] Epoch [{epoch + 1}/{N_EPOCHS}] Loss: {train_loss / len(train_loader):.8f}")
 
     torch.save(model.state_dict(), MODEL_PATH)
-    print(f"💾 Nowy model zapisano w: {MODEL_PATH}")
+    print(f"Nowy model zapisano w: {MODEL_PATH}")
 
 # --- TEST NA CAŁYM ZBIORZE ---
 model.eval()
@@ -179,7 +171,7 @@ with torch.no_grad():
         })
 
 accuracy = correct / total * 100
-print(f"\n🎯 Poprawnie sklasyfikowane: {correct}/{total} ({accuracy:.2f}%)")
+print(f"\nPoprawnie sklasyfikowane: {correct}/{total} ({accuracy:.2f}%)")
 
 # --- WIZUALIZACJA PRZYKŁADÓW ---
 n_show = min(5, len(results))
