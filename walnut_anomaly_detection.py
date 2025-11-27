@@ -191,7 +191,7 @@ for i in range(n_show):
     plt.subplot(3, n_show, i+1+2*n_show)
     plt.imshow(r["anomaly_map"], cmap='hot')
     color = "green" if r["is_correct"] else "red"
-    plt.title(f"Pred: {r['predicted_label']}\n{'✅' if r['is_correct'] else '❌'}", color=color)
+    plt.title(f"Pred: {r['predicted_label']}\n{'ok' if r['is_correct'] else 'nok'}", color=color)
     plt.axis('off')
 
 plt.tight_layout()
