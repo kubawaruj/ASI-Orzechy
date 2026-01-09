@@ -1,22 +1,3 @@
-"""
-train_unet.py
-Segmentacja defektów orzechów włoskich (TensorFlow / Keras)
-Założenia:
-- struktura danych (root):
-    train/good
-    validation/good
-    test_public/good
-    test_public/bad
-    test_public/ground_truth
-    test_private
-    test_private_mixed
-- obrazy: dowolne rozmiary, tło czarne
-- maski: w folderze test_public/ground_truth (jeśli brak maski -> traktujemy jako "no defect")
-Uruchomienie:
-    pip install -U tensorflow opencv-python tqdm
-    python train_unet.py
-"""
-
 import os
 import glob
 import random
@@ -27,32 +8,30 @@ import tensorflow as tf
 from tensorflow.keras import layers, models
 from tensorflow.keras.applications import EfficientNetB0
 from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
-import cv2  # dla czytania/zapisu obrazów
+import cv2
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import random
 
 # ---------------------------
-# Ustawienia (dostosuj)
-# ---------------------------
-DATA_ROOT = "walnuts/walnuts"  # <- ustaw tutaj ścieżkę do korzenia datasetu MVTec
+DATA_ROOT = "walnuts/walnuts" 
 TRAIN_DIR = os.path.join(DATA_ROOT, "train/good")
 VAL_DIR = os.path.join(DATA_ROOT, "validation/good")
 TEST_PUBLIC_DIR = os.path.join(DATA_ROOT, "test_public")
-GT_DIR = os.path.join(TEST_PUBLIC_DIR, "ground_truth/bad")  # maski
+GT_DIR = os.path.join(TEST_PUBLIC_DIR, "ground_truth/bad") 
 IMG_EXT = (".png", ".jpg", ".jpeg", ".tif")
 BATCH_SIZE = 8
-IMAGE_SIZE = (256, 256)  # możesz zmniejszyć do (256,256) jeśli GPU ma mało pamięci
+IMAGE_SIZE = (256, 256)  #(256,256), (512,512), 
 AUTOTUNE = tf.data.AUTOTUNE
-EPOCHS = 50
-MODEL_SAVE = "unet_effb0_segmentation.h5"
-SEED = 42
+EPOCHS = 40
+MODEL_SAVE = "unet_effb0_segmentation.keras"
+SEED = 0
+THRESHOLD = 0.45
+
 # ---------------------------
 random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# ---------------------------
-# Helper: znajdź pliki obrazów
 # ---------------------------
 def list_images(folder):
     files = []
@@ -62,24 +41,14 @@ def list_images(folder):
     return files
 
 # ---------------------------
-# Helper: znajdź maskę odpowiadającą obrazowi
-# Zakładamy: struktura ground_truth może zawierać podfoldery, maski mogą mieć podobną nazwę
-# Strategia: dla obrazu "xxx.png" szukamy "*xxx*.png" w GT_DIR lub podkatalogach,
-# jeśli nie znajdziemy -> zwróć None (będziemy generować maskę zerową).
-# ---------------------------
 def find_mask_for_image(image_path, gt_root=GT_DIR):
     image_name = os.path.basename(image_path)
     name_no_ext = os.path.splitext(image_name)[0]
-    # przeszukaj wszystkie pliki png w gt_root
     candidates = glob.glob(os.path.join(gt_root, "**", f"*{name_no_ext}*.png"), recursive=True)
     if len(candidates) > 0:
         return candidates[0]
-    # czasami nazwa maski: image_000.png -> mask_000.png; spróbuj dopasować końcówkę numerową
-    # fallback: nic nie znaleziono
     return None
 
-# ---------------------------
-# Wczytywanie obrazu i maski, preprocessing
 # ---------------------------
 def read_image(path, size=IMAGE_SIZE):
     img = cv2.imread(path, cv2.IMREAD_COLOR)
@@ -92,32 +61,25 @@ def read_image(path, size=IMAGE_SIZE):
 
 def read_mask(path, size=IMAGE_SIZE):
     if path is None:
-        # brak maski -> zwróć puste (zero) maski
         return np.zeros((size[0], size[1], 1), dtype=np.float32)
     m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if m is None:
         return np.zeros((size[0], size[1], 1), dtype=np.float32)
     m = cv2.resize(m, size, interpolation=cv2.INTER_NEAREST)
-    # normalizuj do 0/1 (maska może mieć wartości 0 i 255)
     m = (m > 127).astype(np.float32)
     return np.expand_dims(m, axis=-1)
 
-# ---------------------------
-# Generator tworzący listę par (image_path, mask_path_or_None)
+
 # ---------------------------
 def build_file_pairs_from_dir(img_dirs, gt_root=GT_DIR):
     pairs = []
     for d in img_dirs:
         imgs = list_images(d)
         for img_path in imgs:
-            # spróbuj dopasować maskę
             mask_path = find_mask_for_image(img_path, gt_root=gt_root)
             pairs.append((img_path, mask_path))
     return pairs
 
-# ---------------------------
-# tf.data pipeline: z plików na batch
-# używamy map z funkcjami numpy->tf, a augmentacje wykonujemy w TF
 # ---------------------------
 def numpy_loader(image_path, mask_path):
     img = read_image(image_path.decode('utf-8'))
@@ -130,8 +92,6 @@ def tf_parse(image_path, mask_path):
     mask.set_shape([IMAGE_SIZE[0], IMAGE_SIZE[1], 1])
     return img, mask
 
-# ---------------------------
-# Augmentacje w TF
 # ---------------------------
 def augment(img, mask):
     # losowe odbicia
@@ -146,40 +106,43 @@ def augment(img, mask):
     if k > 0:
         img = tf.image.rot90(img, k)
         mask = tf.image.rot90(mask, k)
-    # jasność / kontrast
-    img = tf.image.random_brightness(img, max_delta=0.08)
-    img = tf.image.random_contrast(img, lower=0.9, upper=1.1)
-    # drobne przesunięcie i skalowanie (crop/pad)
-    # tu zostawimy prostsze augmentacje — można rozszerzyć
+    # delikatny blur
+    img_uint8 = tf.cast(img * 255.0, tf.uint8)
+    img_uint8 = tf.image.random_jpeg_quality(img_uint8, 80, 100)
+    img = tf.cast(img_uint8, tf.float32) / 255.0
+    # losowy gaussian noise
+    noise = tf.random.normal(tf.shape(img), mean=0.0, stddev=0.02)
+    img = tf.clip_by_value(img + noise, 0.0, 1.0)
     return img, mask
 
 # ---------------------------
-# Dataset builder
-# ---------------------------
-def build_dataset(pairs, batch=BATCH_SIZE, shuffle=True, augment_prob=0.8):
+def build_dataset(pairs, batch=BATCH_SIZE, shuffle=True, augment_prob=0.9):
     img_paths = [p[0] for p in pairs]
     mask_paths = [p[1] if p[1] is not None else 'None' for p in pairs]
     ds = tf.data.Dataset.from_tensor_slices((img_paths, mask_paths))
     if shuffle:
         ds = ds.shuffle(buffer_size=len(img_paths), seed=SEED)
-    ds = ds.map(tf_parse, num_parallel_calls=AUTOTUNE)
+    ds = ds.map(tf_parse, num_parallel_calls=1)
     if shuffle:
-        ds = ds.map(lambda i, m: (i, m), num_parallel_calls=AUTOTUNE)
-    # augmentacje z prawdopodobieństwem
+        ds = ds.map(lambda i, m: (i, m), num_parallel_calls=1)
     def maybe_augment(i, m):
         cond = tf.less(tf.random.uniform([], 0, 1.0), augment_prob)
         i2, m2 = tf.cond(cond, lambda: augment(i, m), lambda: (i, m))
         return i2, m2
-    ds = ds.map(maybe_augment, num_parallel_calls=AUTOTUNE)
-    ds = ds.batch(batch).prefetch(AUTOTUNE)
+    ds = ds.map(maybe_augment, num_parallel_calls=1)
+    ds = ds.batch(batch).prefetch(1)
     return ds
 
-# ---------------------------
-# Model: U-Net z EfficientNetB0 jako enkoder
+
 # ---------------------------
 def conv_block(x, filters):
-    x = layers.Conv2D(filters, 3, padding='same', activation='relu')(x)
-    x = layers.Conv2D(filters, 3, padding='same', activation='relu')(x)
+    x = layers.Conv2D(filters, 3, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+
+    x = layers.Conv2D(filters, 3, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
     return x
 
 def upsample_concat(x, skip, filters):
@@ -189,81 +152,50 @@ def upsample_concat(x, skip, filters):
     outputs = layers.Conv2D(1, 1, activation='sigmoid')(x)
     return outputs
 
-def build_unet_effb0(input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3), encoder_trainable=False):
-    """
-    Budowa U-Net z EfficientNetB0 jako enkoderem.
-    Wersja poprawiona - wyjście zgodne z input 256x256.
-    """
-    def find_skip_layers_by_size(base_model, target_sizes):
-        """
-        Znajdź warstwy enkodera, których output spatial size odpowiada target_sizes.
-        Zwraca listę warstw (od najmniejszej target_size do największej).
-        """
-        found = {}
-        for layer in base_model.layers:
-            out_shape = getattr(layer, 'output_shape', None)
-            if not out_shape or len(out_shape) < 3:
-                continue
-            try:
-                h = out_shape[1]
-                w = out_shape[2]
-            except Exception:
-                continue
-            for t in target_sizes:
-                if h == t and w == t:
-                    found[t] = layer
-        skips = []
-        for t in sorted(target_sizes, reverse=True):
-            if t in found:
-                skips.append(found[t].output)
-            else:
-                skips.append(None)
-        return skips, found
-
-    # ---------------------------
-    # Pretrained encoder
-    # ---------------------------
-    base = EfficientNetB0(include_top=False, weights='imagenet', input_shape=input_shape)
+def build_unet_effb0(
+    input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3),
+    encoder_trainable=False
+):
+    base = EfficientNetB0(
+        include_top=False,
+        weights="imagenet",
+        input_shape=input_shape
+    )
     base.trainable = encoder_trainable
 
-    # oczekiwane spatial sizes dla skipów (input 256 -> [128,64,32,16])
-    H = input_shape[0]
-    target_sizes = [H // 2, H // 4, H // 8, H // 16]
+    skip1 = base.get_layer("block2a_expand_activation").output  # 256×256
+    skip2 = base.get_layer("block3a_expand_activation").output  # 128×128
+    skip3 = base.get_layer("block4a_expand_activation").output  # 64×64
+    skip4 = base.get_layer("block6a_expand_activation").output  # 32×32
 
-    skips, found_map = find_skip_layers_by_size(base, target_sizes)
-
-    # debug: pokaż znalezione warstwy
-    print("Requested skip sizes:", target_sizes)
-    print("Found skip layers (size -> layer name):")
-    for size, layer in found_map.items():
-        print(f"  {size} -> {layer.name}")
-
-    x = base.output  # bottleneck (np. 8x8 przy input 256)
+    x = base.get_layer("top_activation").output  # 16×16
     x = conv_block(x, 512)
 
-    # Dekoder: używamy skips od najmniejszego (16) do największego (128)
-    skips_reversed = list(reversed(skips))
-    filters = [256, 128, 64, 32]
+    x = layers.UpSampling2D((2, 2))(x)
+    x = layers.Concatenate()([x, skip4])
+    x = conv_block(x, 256)
 
-    for skip_tensor, f in zip(skips_reversed, filters):
-        if skip_tensor is None:
-            x = layers.UpSampling2D((2,2))(x)
-            x = conv_block(x, f)
-        else:
-            x = upsample_concat(x, skip_tensor, f)
+    x = layers.UpSampling2D((2, 2))(x)
+    x = layers.Concatenate()([x, skip3])
+    x = conv_block(x, 128)
 
-    # ostatni upsample do rozmiaru wejścia 256x256
-    x = layers.UpSampling2D((2,2))(x)  # 128->256
+    x = layers.UpSampling2D((2, 2))(x)
+    x = layers.Concatenate()([x, skip2])
+    x = conv_block(x, 64)
+
+    x = layers.UpSampling2D((2, 2))(x)
+    x = layers.Concatenate()([x, skip1])
+    x = conv_block(x, 32)
+
+    x = layers.UpSampling2D((2, 2))(x)
     x = conv_block(x, 16)
 
-    outputs = layers.Conv2D(1, 1, activation='sigmoid')(x)
+    outputs = layers.Conv2D(1, 1, activation="sigmoid")(x)
 
     model = models.Model(inputs=base.input, outputs=outputs)
     return model
 
 
-# ---------------------------
-# Losses i metryki: Dice + BCE
 # ---------------------------
 def dice_coef(y_true, y_pred, smooth=1e-6):
     y_true_f = tf.reshape(y_true, [-1])
@@ -274,75 +206,187 @@ def dice_coef(y_true, y_pred, smooth=1e-6):
 def dice_loss(y_true, y_pred):
     return 1.0 - dice_coef(y_true, y_pred)
 
-def bce_dice_loss(y_true, y_pred):
+def weighted_bce_dice_loss(y_true, y_pred):
     bce = tf.keras.losses.BinaryCrossentropy()(y_true, y_pred)
-    d = dice_loss(y_true, y_pred)
-    return bce + d
+    dice = dice_loss(y_true, y_pred)
+    return 0.5 * bce + 0.5 * dice
+
+def tversky(y_true, y_pred, alpha=0.7, beta=0.3, smooth=1e-6):
+    y_true_f = tf.reshape(y_true, [-1])
+    y_pred_f = tf.reshape(y_pred, [-1])
+
+    tp = tf.reduce_sum(y_true_f * y_pred_f)
+    fn = tf.reduce_sum(y_true_f * (1 - y_pred_f))
+    fp = tf.reduce_sum((1 - y_true_f) * y_pred_f)
+
+    return (tp + smooth) / (tp + alpha * fn + beta * fp + smooth)
+
+def focal_tversky_loss(y_true, y_pred, gamma=1.5):
+    tv = tversky(y_true, y_pred)
+    return tf.pow((1 - tv), gamma)
+
+def dice_non_empty(y_true, y_pred, smooth=1e-6):
+    y_true_sum = tf.reduce_sum(y_true, axis=[1,2,3])
+    mask = tf.cast(y_true_sum > 0, tf.float32)
+
+    y_true_f = tf.reshape(y_true, [tf.shape(y_true)[0], -1])
+    y_pred_f = tf.reshape(y_pred, [tf.shape(y_pred)[0], -1])
+
+    intersection = tf.reduce_sum(y_true_f * y_pred_f, axis=1)
+    dice = (2. * intersection + smooth) / (
+        tf.reduce_sum(y_true_f, axis=1) +
+        tf.reduce_sum(y_pred_f, axis=1) +
+        smooth
+    )
+
+    return tf.reduce_sum(dice * mask) / (tf.reduce_sum(mask) + smooth)
+
+def combined_loss(y_true, y_pred):
+    return 0.3 * tf.keras.losses.BinaryCrossentropy()(y_true, y_pred) + 0.7 * focal_tversky_loss(y_true, y_pred)
 
 # ---------------------------
-# Przygotowanie danych
+class VisualizePredictions(tf.keras.callbacks.Callback):
+    def __getstate__(self):
+        return {}
+    def __setstate__(self, state):
+        pass
+
+    def __init__(self, sample_paths, interval=5, threshold=THRESHOLD):
+        super().__init__()
+        self.sample_paths = sample_paths
+        self.interval = interval
+        self.threshold = threshold
+
+    def on_epoch_end(self, epoch, logs=None):
+        if (epoch + 1) % self.interval != 0:
+            return
+
+        for path in self.sample_paths:
+            img = read_image(path, size=IMAGE_SIZE)
+            pred = self.model.predict(np.expand_dims(img, axis=0), verbose=0)[0, ..., 0]
+            mask_pred = (pred >= self.threshold).astype(np.uint8)
+
+            mask_gt_path = find_mask_for_image(path)
+            mask_gt = read_mask(mask_gt_path, size=IMAGE_SIZE)
+
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(12,4))
+            plt.subplot(1,3,1)
+            plt.imshow(img)
+            plt.title("Obraz")
+            plt.axis('off')
+
+            plt.subplot(1,3,2)
+            plt.imshow(mask_pred, cmap='gray')
+            plt.title("Maska - predykcja")
+            plt.axis('off')
+
+            plt.subplot(1,3,3)
+            plt.imshow(mask_gt[...,0], cmap='gray')
+            plt.title("Maska - ground truth")
+            plt.axis('off')
+            plt.show()
+
+
+
 # ---------------------------
-# przykładowo bierzemy wszystkie obrazy z train/good jako train (tu bez masek -> zero mask),
-# oraz validation/good jako val; jeśli masz specjalny split z maskami użyj go.
-train_pairs = build_file_pairs_from_dir([TRAIN_DIR])
+train_good_pairs = build_file_pairs_from_dir([TRAIN_DIR])
+BAD_TRAIN_DIR = os.path.join(TEST_PUBLIC_DIR, "bad")
+train_bad_pairs = build_file_pairs_from_dir([BAD_TRAIN_DIR], gt_root=GT_DIR)
+
+mult = max(1, len(train_good_pairs) // max(1, len(train_bad_pairs)))
+train_bad_pairs_oversampled = train_bad_pairs * mult
+
+train_pairs = train_good_pairs + train_bad_pairs_oversampled
+random.shuffle(train_pairs)
+
 val_pairs = build_file_pairs_from_dir([VAL_DIR])
 
-print(f"Train samples: {len(train_pairs)}, Val samples: {len(val_pairs)}")
+def has_defect(pair):
+    return pair[1] is not None
 
-train_ds = build_dataset(train_pairs, batch=BATCH_SIZE, shuffle=True, augment_prob=0.9)
+pairs_defect = [p for p in train_pairs if has_defect(p)]
+pairs_empty = [p for p in train_pairs if not has_defect(p)]
+
+train_pairs_balanced = []
+for _ in range(len(train_pairs)):
+    if random.random() < 0.6:
+        train_pairs_balanced.append(random.choice(pairs_defect))
+    else:
+        train_pairs_balanced.append(random.choice(pairs_empty))
+
+
+print(f"Train samples: {len(train_pairs_balanced)}, Val samples: {len(val_pairs)}")
+train_ds = build_dataset(train_pairs_balanced, batch=BATCH_SIZE, shuffle=True, augment_prob=0.9)
 val_ds = build_dataset(val_pairs, batch=BATCH_SIZE, shuffle=False, augment_prob=0.0)
 
 # ---------------------------
-# Build model
-# ---------------------------
-model = build_unet_effb0(input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3), encoder_trainable=False)
+if os.path.exists(MODEL_SAVE):
+    print(f"Wczytuję istniejący model z pliku: {MODEL_SAVE}")
+    model = tf.keras.models.load_model(
+        MODEL_SAVE,
+        custom_objects={'combined_loss': combined_loss, 'dice_non_empty': dice_non_empty}
+    )
+else:
+    print("Tworzę nowy model U-Net z EfficientNetB0")
+    model = build_unet_effb0(input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3), encoder_trainable=False)
+
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-4), 
+              loss=combined_loss, 
+              metrics=[dice_non_empty])
+
 model.summary()
 
-# compile
-optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
-model.compile(optimizer=optimizer, loss=bce_dice_loss, metrics=[dice_coef, tf.keras.metrics.MeanIoU(num_classes=2)])
-
 # ---------------------------
-# Callbacks
+img_batch, mask_batch = next(iter(train_ds))
+print("Image batch shape:", img_batch.shape)
+print("Mask batch shape:", mask_batch.shape)
+print("Mask mean value:", tf.reduce_mean(mask_batch).numpy())
+
+
+import matplotlib.pyplot as plt
+for i in range(min(3, mask_batch.shape[0])):
+    plt.imshow(mask_batch[i, ..., 0], cmap='gray')
+    plt.title(f"Mask {i}")
+    plt.show()
+
 # ---------------------------
 os.makedirs("checkpoints", exist_ok=True)
-checkpoint_cb = ModelCheckpoint("checkpoints/best_model.h5", save_best_only=True, monitor='val_loss', mode='min')
+checkpoint_cb = ModelCheckpoint("checkpoints/best_model.keras", save_best_only=True, monitor='val_loss', mode='min')
 reduce_cb = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, verbose=1)
-#early_cb = EarlyStopping(monitor='val_loss', patience=12, verbose=1, restore_best_weights=True)
+early_cb = EarlyStopping(monitor='val_loss', patience=10, verbose=1, restore_best_weights=True)
 
-# ---------------------------
-# Train
+sample_paths = random.sample(list_images(BAD_TRAIN_DIR), min(3, len(train_bad_pairs)))
+visual_cb = VisualizePredictions(sample_paths, interval=20, threshold=THRESHOLD)
+
 # ---------------------------
 history = model.fit(
     train_ds,
     epochs=EPOCHS,
     validation_data=val_ds,
-    callbacks=[checkpoint_cb, reduce_cb]
+    callbacks=[checkpoint_cb, early_cb, visual_cb]
+    #callbacks=[checkpoint_cb, reduce_cb, early_cb, visual_cb]
+    #callbacks=[checkpoint_cb, reduce_cb]
     #callbacks=[checkpoint_cb, reduce_cb, early_cb]
 )
 
-# zapisz finalny model
 model.save(MODEL_SAVE)
 
 # ---------------------------
-# Inference helper: zapis progowanych masek
-# ---------------------------
-def predict_and_save(model, image_paths, out_dir="predictions", threshold=0.5):
+def predict_and_save(model, image_paths, out_dir="predictions", threshold=THRESHOLD):
     os.makedirs(out_dir, exist_ok=True)
     for p in tqdm(image_paths):
         img = read_image(p, size=IMAGE_SIZE)
         inp = np.expand_dims(img, axis=0)
         pred = model.predict(inp)[0,...,0]
         mask = (pred >= threshold).astype(np.uint8) * 255
-        # zapisz maskę z tą samą nazwą jak obraz
         name = os.path.basename(p)
         out_path = os.path.join(out_dir, f"{os.path.splitext(name)[0]}_mask.png")
         cv2.imwrite(out_path, mask)
 
-# przykładowe użycie na test_public/bad
 test_bad = list_images(os.path.join(TEST_PUBLIC_DIR, "bad"))
 if len(test_bad) > 0:
-    predict_and_save(model, test_bad, out_dir="predictions/test_public_bad", threshold=0.45)
+    predict_and_save(model, test_bad, out_dir="predictions/test_public_bad", threshold=THRESHOLD)
 
 
 plt.plot(history.history['loss'])
@@ -350,8 +394,8 @@ plt.plot(history.history['val_loss'])
 plt.legend(['train_loss', 'val_loss'])
 plt.show()
 
-plt.plot(history.history['dice_coef'])
-plt.plot(history.history['val_dice_coef'])
+plt.plot(history.history['dice_non_empty'])
+plt.plot(history.history['val_dice_non_empty'])
 plt.legend(['train_dice', 'val_dice'])
 plt.show()
 
@@ -359,18 +403,14 @@ test_images = list_images(os.path.join(TEST_PUBLIC_DIR, "bad"))
 sample_paths = random.sample(test_images, min(5, len(test_images)))
 
 for path in sample_paths:
-    # Wczytaj obraz
     img = read_image(path, size=IMAGE_SIZE)
 
-    # Predykcja modelu
     pred = model.predict(np.expand_dims(img, axis=0))[0, ..., 0]
     mask_pred = (pred >= 0.5).astype(np.uint8)
 
-    # Wczytaj ground truth (jeśli dostępna)
     mask_gt_path = find_mask_for_image(path)
     mask_gt = read_mask(mask_gt_path, size=IMAGE_SIZE)
 
-    # Wyświetlanie
     plt.figure(figsize=(12,4))
     plt.subplot(1,3,1)
     plt.imshow(img)
@@ -379,15 +419,15 @@ for path in sample_paths:
 
     plt.subplot(1,3,2)
     plt.imshow(mask_pred, cmap='gray')
-    plt.title("Maska – predykcja")
+    plt.title("Maska - predykcja")
     plt.axis('off')
 
     plt.subplot(1,3,3)
     plt.imshow(mask_gt[...,0], cmap='gray')
-    plt.title("Maska – ground truth")
+    plt.title("Maska - ground truth")
     plt.axis('off')
 
     plt.show()
 
-
+pred.mean()
 print("Koniec skryptu. Modele i predykcje zapisane.")
