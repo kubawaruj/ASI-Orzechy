@@ -29,6 +29,10 @@ share/python-wheels/
 walnuts/
 checkpoints/
 predictions/
+predictions_v3/
+predictions_v4/
+train_unet_v2.py
+train_unet_v3.py
 unet_effb0_segmentation.h5
 *.keras
 *.h5
